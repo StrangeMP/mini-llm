@@ -1,9 +1,23 @@
 from dataclasses import dataclass
+from importlib import import_module
 from linear import Linear
 import torch, math
 from torch import nn
 from typing import TypedDict
 from compute import softmax, cross_entropy_loss
+
+try:
+    flash_attn_module = import_module("flash_attn")
+except ImportError:
+    try:
+        flash_attn_module = import_module("flash_attn_interface")
+    except ImportError:
+        flash_attn_module = None
+
+flash_attn_qkvpacked_func = getattr(
+    flash_attn_module, "flash_attn_qkvpacked_func", None
+)
+flash_attn_func = getattr(flash_attn_module, "flash_attn_func", None)
 
 
 class Embedding(nn.Module):
@@ -204,11 +218,58 @@ class MultiHeadAttention(nn.Module):
         if past_key_value is not None:
             k = torch.cat([past_key_value["key"], k], dim=-3)
             v = torch.cat([past_key_value["value"], v], dim=-3)
-        qk = torch.einsum("...ihd,...jhd->...hij", q, k) / self.sqrt_d_head
-        if mask is not None:
-            qk = qk.masked_fill(~mask, -torch.inf)
-        qk = softmax(qk, dim=-1).to(v.dtype)
-        out = torch.einsum("...hij,...jhd->...ihd", qk, v)
+
+        flash_causal = False
+        flash_mask_is_supported = mask is None
+        if mask is not None and len(batch_dims) == 1:
+            key_seq_len = k.shape[-3]
+            if mask.shape == (seq_len, seq_len):
+                mask_for_flash = mask
+            elif mask.shape == (batch_dims[0], 1, seq_len, key_seq_len):
+                mask_for_flash = mask[:, 0]
+            else:
+                mask_for_flash = None
+            if mask_for_flash is not None:
+                query_positions = torch.arange(
+                    key_seq_len - seq_len,
+                    key_seq_len,
+                    device=mask.device,
+                )
+                key_positions = torch.arange(key_seq_len, device=mask.device)
+                causal_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+                causal_mask = causal_mask.expand_as(mask_for_flash)
+                flash_mask_is_supported = bool(
+                    torch.all(mask_for_flash)
+                    or torch.equal(mask_for_flash, causal_mask)
+                )
+                flash_causal = torch.equal(mask_for_flash, causal_mask)
+
+        use_flash_attention = bool(
+            (flash_attn_qkvpacked_func is not None or flash_attn_func is not None)
+            and x.is_cuda
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and len(batch_dims) == 1
+            and flash_mask_is_supported
+        )
+        if use_flash_attention and past_key_value is None and flash_attn_qkvpacked_func is not None:
+            qkv = torch.stack((q, k, v), dim=-3).to(dtype=x.dtype)
+            out = flash_attn_qkvpacked_func(
+                qkv, softmax_scale=1 / self.sqrt_d_head, causal=flash_causal
+            )
+        elif use_flash_attention and flash_attn_func is not None:
+            out = flash_attn_func(
+                q.to(dtype=x.dtype),
+                k.to(dtype=x.dtype),
+                v.to(dtype=x.dtype),
+                softmax_scale=1 / self.sqrt_d_head,
+                causal=flash_causal,
+            )
+        else:
+            qk = torch.einsum("...ihd,...jhd->...hij", q, k) / self.sqrt_d_head
+            if mask is not None:
+                qk = qk.masked_fill(~mask, -torch.inf)
+            qk = softmax(qk, dim=-1).to(v.dtype)
+            out = torch.einsum("...hij,...jhd->...ihd", qk, v)
         out = out.reshape(*batch_dims, seq_len, self.d_model)
         out = self.o(out)
         present = LayerCache({"key": k, "value": v}) if use_cache else None
@@ -306,14 +367,14 @@ class LMOutput(dict):
 
 @dataclass
 class ModelConfig:
-    vocab_size: int
-    context_length: int
-    d_model: int
-    n_layer: int
-    n_head: int
+    vocab_size: int = 50257
+    context_length: int = 1024
+    d_model: int = 768
+    n_layer: int = 12
+    n_head: int = 12
     rope_base: float = 10000.0
-    dtype: str = "float32"
-    device: str = "cpu"
+    dtype: str = "bfloat16"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 class TransformerLM(nn.Module):
@@ -329,16 +390,16 @@ class TransformerLM(nn.Module):
         device: torch.device | None = None,
     ) -> None:
         super().__init__()
-        self.config = {
-            "vocab_size": vocab_size,
-            "context_length": context_length,
-            "d_model": d_model,
-            "num_heads": num_heads,
-            "num_layers": num_layers,
-            "RoPE_base": RoPE_base,
-            "dtype": str(dtype),
-            "device": str(device),
-        }
+        self.config = ModelConfig(
+            vocab_size=vocab_size,
+            context_length=context_length,
+            d_model=d_model,
+            n_layer=num_layers,
+            n_head=num_heads,
+            rope_base=RoPE_base,
+            dtype=str(dtype).removeprefix("torch."),
+            device=str(device),
+        )
         self.emb = Embedding(vocab_size, d_model, dtype=dtype, device=device)
         self.blocks = nn.ModuleList(
             [
@@ -356,8 +417,11 @@ class TransformerLM(nn.Module):
         self.post_norm = RMSLayerNorm(d_model, dtype=dtype, device=device)
         self.lm_head = nn.Linear(d_model, vocab_size, dtype=dtype, device=device)
 
+    def get_config(self) -> ModelConfig:
+        return self.config
+
     @classmethod
-    def from_config(cls, config: "ModelConfig"):
+    def from_config(cls, config: ModelConfig):
         return cls(
             vocab_size=config.vocab_size,
             context_length=config.context_length,
@@ -391,10 +455,10 @@ class TransformerLM(nn.Module):
         past_seq_len = (
             past_key_values[0]["key"].shape[-3] if past_key_values is not None else 0
         )
-        if past_seq_len + seq_len > self.config["context_length"]:
+        if past_seq_len + seq_len > self.config.context_length:
             raise ValueError(
                 "sequence length including cached tokens must not exceed "
-                f"context_length ({self.config['context_length']}), got "
+                f"context_length ({self.config.context_length}), got "
                 f"{past_seq_len + seq_len}"
             )
         attention_mask = mask
@@ -509,10 +573,10 @@ class TransformerLM(nn.Module):
             return torch.multinomial(probs, num_samples=1).to(dtype=torch.long)
 
         with torch.inference_mode():
-            if token_ids.shape[-1] + max_new_tokens > self.config["context_length"]:
+            if token_ids.shape[-1] + max_new_tokens > self.config.context_length:
                 raise ValueError(
                     "prompt and generated tokens must fit within "
-                    f"context_length ({self.config['context_length']}), got "
+                    f"context_length ({self.config.context_length}), got "
                     f"{token_ids.shape[-1] + max_new_tokens}"
                 )
             if attention_mask is None:

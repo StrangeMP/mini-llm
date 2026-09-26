@@ -1,8 +1,10 @@
 from collections.abc import Callable, Iterable
+from dataclasses import asdict
 from typing import Optional
 import torch
 from torch import nn
 import math
+from transformer import ModelConfig, TransformerLM
 
 
 class SGD(torch.optim.Optimizer):
@@ -132,7 +134,6 @@ class CosineAnnealingLRwithWarmup(torch.optim.lr_scheduler.LRScheduler):
         ]
 
 
-
 def gradient_clipping_(
     parameters: Iterable[torch.nn.Parameter], max_norm: float, eps: float = 1e-6
 ) -> None:
@@ -141,6 +142,7 @@ def gradient_clipping_(
     parameters: iterable of parameters whose gradients will be clipped
     max_norm: maximum allowed norm of the gradients
     """
+    parameters = list(parameters)
     total_norm = 0.0
     for p in parameters:
         if p.grad is not None:
@@ -159,26 +161,131 @@ def save_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     step: int,
     out,  # file path or file-like object passed to torch.save
+    train_config: Optional[dict] = None,
 ):
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "step": step,
+        "train_config": train_config, # old checkpoints may not have this key
+        "model_config": asdict(model.get_config()),
     }
     torch.save(checkpoint, out)
 
 
+def create_training_objects(
+    model_config: ModelConfig, train_config
+) -> tuple[TransformerLM, AdamW, CosineAnnealingLRwithWarmup]:
+    model = TransformerLM.from_config(model_config)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=train_config.max_lr,
+        beta1=train_config.beta1,
+        beta2=train_config.beta2,
+        eps=train_config.eps,
+        lmda=train_config.weight_decay,
+    )
+    scheduler = CosineAnnealingLRwithWarmup(
+        optimizer,
+        train_config.warmup_steps,
+        train_config.total_steps,
+        train_config.min_lr,
+    )
+    return model, optimizer, scheduler
+
+
+def _config_value(config, key: str):
+    if hasattr(config, key):
+        return getattr(config, key)
+    return config.get(key)
+
+
+def _configs_align(saved_config: dict, current_config) -> bool:
+    trajectory_keys = (
+        "train_token_budget",
+        "batch_size",
+        "gradient_accumulation_steps",
+        "max_lr",
+        "min_lr",
+        "weight_decay",
+        "beta1",
+        "beta2",
+        "eps",
+    )
+    return all(
+        saved_config.get(key) == _config_value(current_config, key)
+        for key in trajectory_keys
+    )
+
+
+def _infer_resume_step(
+    checkpoint_step: int, saved_config: dict, train_config, context_length: int
+) -> int:
+    consumed_tokens = (
+        (checkpoint_step + 1)
+        * saved_config["batch_size"]
+        * saved_config["gradient_accumulation_steps"]
+        * context_length
+    )
+    current_tokens_per_step = (
+        _config_value(train_config, "batch_size")
+        * _config_value(train_config, "gradient_accumulation_steps")
+        * context_length
+    )
+    return consumed_tokens // current_tokens_per_step - 1
+
+
 def load_checkpoint(
     src,  # file path or file-like object passed to torch.load
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer  | None = None,
-    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    train_config,
+    device: str | torch.device | None = None,
 ):
-    checkpoint = torch.load(src, map_location=torch.device(model.config['device']))
+    target_device = torch.device(device) if device is not None else None
+    default_model_config = ModelConfig(
+        device=str(target_device) if target_device is not None else ModelConfig().device
+    )
+    checkpoint = torch.load(
+        src,
+        map_location=target_device or torch.device(default_model_config.device),
+    )
+    saved_model_config = checkpoint.get("model_config")
+    model_config = ModelConfig(**saved_model_config) if saved_model_config else default_model_config
+    if target_device is not None:
+        model_config.device = str(target_device)
+    model, optimizer, scheduler = create_training_objects(model_config, train_config)
     model.load_state_dict(checkpoint["model_state_dict"])
-    if optimizer is not None:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    if scheduler is not None:
+
+    saved_config = checkpoint.get("train_config")
+    if saved_config is None:
+        saved_config = asdict(type(train_config)())
+
+    checkpoint_step = checkpoint["step"]
+    if _configs_align(saved_config, train_config):
+        # Restore the initialized scheduler before optimizer state, as required
+        # by PyTorch because optimizer restoration overwrites param-group rates.
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-    return checkpoint["step"]
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        return model, optimizer, scheduler, checkpoint_step
+
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    step = _infer_resume_step(
+        checkpoint_step, saved_config, train_config, model_config.context_length
+    )
+    for parameter_group in optimizer.param_groups:
+        parameter_group.update(
+            lr=train_config.max_lr,
+            initial_lr=train_config.max_lr,
+            beta1=train_config.beta1,
+            beta2=train_config.beta2,
+            eps=train_config.eps,
+            lmda=train_config.weight_decay,
+        )
+    scheduler = CosineAnnealingLRwithWarmup(
+        optimizer,
+        train_config.warmup_steps,
+        train_config.total_steps,
+        train_config.min_lr,
+        last_epoch=step,
+    )
+    return model, optimizer, scheduler, step
