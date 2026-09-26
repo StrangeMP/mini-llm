@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 from datasets import load_from_disk
 import torch, wandb, os
+from tqdm import tqdm
 from torch.utils.data import DataLoader
 from transformer import TransformerLM, ModelConfig
 from trainutils import (
@@ -28,6 +29,13 @@ parser.add_argument(
     default="cuda",
     help="Torch device for the model, for example cuda or cpu",
 )
+parser.add_argument(
+    "--dtype",
+    type=str,
+    choices=("float32", "float16", "bfloat16"),
+    default="bfloat16",
+    help="Floating-point precision for model parameters",
+)
 parser.add_argument("--wandb-run-name", type=str, default=None)
 args = parser.parse_args()
 
@@ -41,6 +49,7 @@ model_config = ModelConfig( # gpt-2 small configuration
     n_layer=12,
     n_head=12,
     rope_base=10000.0,
+    dtype=args.dtype,
     device=args.device,
 )
 
@@ -50,18 +59,20 @@ class TrainingConfig:
     eval_token_budget: int = train_token_budget // 100
     train_examples_budget: int = train_token_budget // model_config.context_length
     eval_examples_budget: int = eval_token_budget // model_config.context_length
-    batch_size: int = 32
+    batch_size: int = 12
+    gradient_accumulation_steps: int = 1
     max_lr: float = 3e-4
     min_lr: float = 3e-5
     weight_decay: float = 1e-2
     beta1: float = 0.9
     beta2: float = 0.999
     eps: float = 1e-8
-    warmup_steps: int = 1000
-    total_steps: int = train_examples_budget // batch_size
-    eval_num_batches: int = eval_examples_budget // batch_size
-    save_interval: int = 1000
-    eval_interval: int = 1000
+    total_batches: int = train_examples_budget // batch_size
+    total_steps: int = total_batches // gradient_accumulation_steps
+    warmup_steps: int = int(total_steps * 0.01)
+    eval_num_batches: int = 256
+    save_interval: int = int(0.05 * total_steps)
+    eval_interval: int = int(0.01 * total_steps)
     train_dataset_path: str = dataset_base_path + "_train"
     eval_dataset_path: str = dataset_base_path + "_eval"
     model_save_path: str = os.path.join(DISKROOT, "models/mini-llm")
@@ -131,6 +142,7 @@ optimizer = AdamW(
 lr_scheduler = CosineAnnealingLRwithWarmup(
     optimizer, train_config.warmup_steps, train_config.total_steps, train_config.min_lr
 )
+model_device = next(model.parameters()).device
 step = -1
 if resume_from is not None:
     step = load_checkpoint(resume_from, model, optimizer, lr_scheduler)
@@ -142,8 +154,9 @@ def evaluate(model: TransformerLM, loader: DataLoader) -> float:
     total_loss = 0.0
     batch_count = 0
     with torch.no_grad():
-        for batch in loader:
-            loss = model(batch["input_ids"], compute_loss=True).loss
+        for batch in tqdm(loader, total=train_config.eval_num_batches, desc="Evaluation", leave=False):
+            input_ids = batch["input_ids"].to(model_device, non_blocking=True)
+            loss = model(input_ids, compute_loss=True).loss
             total_loss += loss.item()
             batch_count += 1
 
@@ -156,34 +169,48 @@ def evaluate(model: TransformerLM, loader: DataLoader) -> float:
 
 try:
     model.train()
-    for step, batch in enumerate(train_loader, start=step + 1):
-        if step >= train_config.total_steps:
-            break
-        loss: torch.Tensor = model(batch["input_ids"], compute_loss=True).loss
-        optimizer.zero_grad()
-        loss.backward()
-        gradient_clipping_(model.parameters(), 1.0)
-        optimizer.step()
-        lr_scheduler.step()
+    optimizer.zero_grad()
+    with tqdm(
+        total=train_config.total_steps,
+        initial=step + 1,
+        desc="Training",
+        unit="step",
+    ) as progress:
+        for micro_step, batch in enumerate(train_loader):
+            if step >= train_config.total_steps - 1:
+                break
+            input_ids = batch["input_ids"].to(model_device, non_blocking=True)
+            loss: torch.Tensor = model(input_ids, compute_loss=True).loss
+            (loss / train_config.gradient_accumulation_steps).backward()
 
-        wandb.log(
-            {
-                "train/loss": loss.item(),
-                "train/learning_rate": lr_scheduler.get_last_lr()[0],
-            },
-            step=step,
-        )
+            if (micro_step + 1) % train_config.gradient_accumulation_steps != 0:
+                continue
 
-        if step % train_config.eval_interval == 0:
-            wandb.log({"eval/loss": evaluate(model, eval_loader)}, step=step)
-            model.train()
+            gradient_clipping_(model.parameters(), 1.0)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+            step += 1
+            progress.update(1)
 
-        if step % train_config.save_interval == 0:
-            checkpoint_path = os.path.join(
-                train_config.model_save_path, f"checkpoint_step_{step}.pt"
+            wandb.log(
+                {
+                    "train/loss": loss.item(),
+                    "train/learning_rate": lr_scheduler.get_last_lr()[0],
+                },
+                step=step,
             )
-            save_checkpoint(model, optimizer, lr_scheduler, step, checkpoint_path)
-            wandb.save(checkpoint_path)
+
+            if step % train_config.eval_interval == 0:
+                wandb.log({"eval/loss": evaluate(model, eval_loader)}, step=step)
+                model.train()
+
+            if step % train_config.save_interval == 0:
+                checkpoint_path = os.path.join(
+                    train_config.model_save_path, f"checkpoint_step_{step}.pt"
+                )
+                save_checkpoint(model, optimizer, lr_scheduler, step, checkpoint_path)
+                wandb.save(checkpoint_path)
 except KeyboardInterrupt:
     checkpoint_path = os.path.join(
         train_config.model_save_path, f"checkpoint_interrupt_step_{step}.pt"

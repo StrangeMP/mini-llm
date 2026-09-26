@@ -172,11 +172,13 @@ def save_checkpoint(
 def load_checkpoint(
     src,  # file path or file-like object passed to torch.load
     model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    optimizer: torch.optim.Optimizer  | None = None,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
 ):
-    checkpoint = torch.load(src)
+    checkpoint = torch.load(src, map_location=torch.device(model.config['device']))
     model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if scheduler is not None:
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     return checkpoint["step"]

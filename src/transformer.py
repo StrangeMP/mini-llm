@@ -189,7 +189,7 @@ class MultiHeadAttention(nn.Module):
         x: torch.Tensor,
         mask: (
             torch.Tensor | None
-        ) = None,  # mask w.r.t. x combined with past_key_values, shape (seq_len, seq_len + past_seq_len)
+        ) = None,  # padding mask over x and cache, shape (batch, seq_len + past_seq_len)
         token_positions: torch.Tensor | None = None,
         past_key_value: LayerCache | None = None,
         use_cache: bool = False,
@@ -207,13 +207,41 @@ class MultiHeadAttention(nn.Module):
         qk = torch.einsum("...ihd,...jhd->...hij", q, k) / self.sqrt_d_head
         if mask is not None:
             qk = qk.masked_fill(~mask, -torch.inf)
-        qk = softmax(qk, dim=-1)
+        qk = softmax(qk, dim=-1).to(v.dtype)
         out = torch.einsum("...hij,...jhd->...ihd", qk, v)
         out = out.reshape(*batch_dims, seq_len, self.d_model)
         out = self.o(out)
         present = LayerCache({"key": k, "value": v}) if use_cache else None
         return out, present
 
+def create_causal_mask(
+    attention_mask: torch.Tensor | None,
+    batch_size: int,
+    seq_len: int,
+    past_seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Combine a batch-specific padding mask with the causal constraint."""
+    total_seq_len = past_seq_len + seq_len
+    if attention_mask is None:
+        key_is_valid = torch.ones(
+            (batch_size, total_seq_len), dtype=torch.bool, device=device
+        )
+    else:
+        if attention_mask.ndim != 2 or attention_mask.shape != (
+            batch_size,
+            total_seq_len,
+        ):
+            raise ValueError(
+                "attention mask must have shape "
+                f"({batch_size}, {total_seq_len}), got {tuple(attention_mask.shape)}"
+            )
+        key_is_valid = attention_mask.to(device=device, dtype=torch.bool)
+
+    query_positions = torch.arange(seq_len, device=device) + past_seq_len
+    key_positions = torch.arange(total_seq_len, device=device)
+    is_causal = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+    return is_causal.unsqueeze(0).unsqueeze(1) & key_is_valid[:, None, None, :]
 
 class TransformerBlock(nn.Module):
     def __init__(
@@ -243,7 +271,7 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         mask: (
             torch.Tensor | None
-        ) = None,  # mask w.r.t. x combined with past_key_values, shape (seq_len, seq_len + past_seq_len)
+        ) = None,  # padding mask over x and cache, shape (batch, seq_len + past_seq_len)
         token_positions: torch.Tensor | None = None,
         past_key_value: LayerCache | None = None,
         use_cache: bool = False,
@@ -344,7 +372,7 @@ class TransformerLM(nn.Module):
     def forward(
         self,
         token_ids: torch.Tensor,
-        # mask w.r.t. token_ids combined with past_key_values, shape (seq_len, seq_len + past_seq_len)
+        # 2D padding mask over current and cached tokens: (batch, seq_len + past_seq_len)
         mask: torch.Tensor | None = None,
         past_key_values: list[LayerCache] | None = None,
         token_positions: torch.Tensor | None = None,
@@ -353,7 +381,7 @@ class TransformerLM(nn.Module):
     ) -> LMOutput:
         """
         token_ids: (batch, seq_len)
-        mask: (seq_len, seq_len + past_seq_len)
+        mask: (batch, seq_len + past_seq_len)
         past_key_values: list of LayerCache, length num_layers
         seq_len is the length of the current input sequence, which may be less than the context length if we are doing incremental decoding.
         """
@@ -363,16 +391,23 @@ class TransformerLM(nn.Module):
         past_seq_len = (
             past_key_values[0]["key"].shape[-3] if past_key_values is not None else 0
         )
-        if mask is None:
-            mask = torch.tril(
-                torch.ones(
-                    seq_len,
-                    seq_len + past_seq_len,
-                    dtype=torch.bool,
-                    device=token_ids.device,
-                ),
-                diagonal=past_seq_len,
+        if past_seq_len + seq_len > self.config["context_length"]:
+            raise ValueError(
+                "sequence length including cached tokens must not exceed "
+                f"context_length ({self.config['context_length']}), got "
+                f"{past_seq_len + seq_len}"
             )
+        attention_mask = mask
+        combined_mask = create_causal_mask(
+            attention_mask=attention_mask,
+            batch_size=token_ids.shape[0],
+            seq_len=seq_len,
+            past_seq_len=past_seq_len,
+            device=token_ids.device,
+        )
+        if token_positions is None and attention_mask is not None:
+            valid_tokens = attention_mask.to(dtype=torch.long).cumsum(dim=-1) - 1
+            token_positions = valid_tokens[:, -seq_len:].clamp_min(0)
         hidden_states: list[torch.Tensor] = []
         present_key_values: list[LayerCache] | None = [] if use_cache else None
         for layer_idx, block in enumerate(self.blocks):
@@ -381,7 +416,7 @@ class TransformerLM(nn.Module):
             )
             embeddings, present = block(
                 embeddings,
-                mask=mask,
+                mask=combined_mask,
                 token_positions=(
                     token_positions
                     if token_positions is not None
@@ -403,8 +438,12 @@ class TransformerLM(nn.Module):
 
         loss = None
         if compute_loss:
+            targets = token_ids[:, 1:]
+            if attention_mask is not None:
+                valid_predictions = attention_mask[:, :-1].bool() & attention_mask[:, 1:].bool()
+                targets = targets.masked_fill(~valid_predictions, -100)
             loss = cross_entropy_loss(
-                logits=logits[:, :-1, :], targets=token_ids[:, 1:], ignore_idx=-100
+                logits=logits[:, :-1, :], targets=targets, ignore_idx=-100
             )
 
         return LMOutput(
@@ -421,6 +460,7 @@ class TransformerLM(nn.Module):
         temperature: float = 1.0,
         top_k: int | None = None,
         top_p: float | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         token_ids: (batch, seq_len)
@@ -457,7 +497,7 @@ class TransformerLM(nn.Module):
                 probs = torch.softmax(scaled_logits, dim=-1)
                 sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
                 cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-                keep_mask = cumulative_probs <= top_p
+                keep_mask = (cumulative_probs - sorted_probs) < top_p
                 keep_mask[..., :1] = True
                 filtered = torch.zeros_like(probs, dtype=torch.bool)
                 filtered.scatter_(-1, sorted_indices, keep_mask)
@@ -469,15 +509,54 @@ class TransformerLM(nn.Module):
             return torch.multinomial(probs, num_samples=1).to(dtype=torch.long)
 
         with torch.inference_mode():
-            output = self.forward(token_ids=token_ids, use_cache=True, compute_loss=False)
+            if token_ids.shape[-1] + max_new_tokens > self.config["context_length"]:
+                raise ValueError(
+                    "prompt and generated tokens must fit within "
+                    f"context_length ({self.config['context_length']}), got "
+                    f"{token_ids.shape[-1] + max_new_tokens}"
+                )
+            if attention_mask is None:
+                attention_mask = torch.ones_like(token_ids, dtype=torch.bool)
+            else:
+                if attention_mask.shape != token_ids.shape:
+                    raise ValueError(
+                        "attention_mask must have the same shape as token_ids, got "
+                        f"{tuple(attention_mask.shape)} and {tuple(token_ids.shape)}"
+                    )
+                attention_mask = attention_mask.to(
+                    device=token_ids.device, dtype=torch.bool
+                )
+                if not attention_mask.any(dim=-1).all():
+                    raise ValueError("each batch row must contain at least one real token")
+
+            output = self.forward(
+                token_ids=token_ids,
+                mask=attention_mask,
+                use_cache=True,
+                compute_loss=False,
+            )
             kv_cache = output.past_key_values
-            logits = output.logits[..., -1, :]
+            last_positions = attention_mask.sum(dim=-1) - 1
+            batch_positions = torch.arange(token_ids.shape[0], device=token_ids.device)
+            logits = output.logits[batch_positions, last_positions, :]
             new_token = sample_next(logits)
             buffer = [new_token]
 
             for _ in range(1, max_new_tokens):
+                attention_mask = torch.cat(
+                    [
+                        attention_mask,
+                        torch.ones(
+                            (token_ids.shape[0], 1),
+                            dtype=torch.bool,
+                            device=token_ids.device,
+                        ),
+                    ],
+                    dim=-1,
+                )
                 output = self.forward(
                     token_ids=new_token,
+                    mask=attention_mask,
                     past_key_values=kv_cache,
                     use_cache=True,
                     compute_loss=False,
